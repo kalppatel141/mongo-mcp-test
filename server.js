@@ -12,23 +12,24 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ─── MONGO SETUP ─────────────────────────────────
+if (!process.env.MONGO_URI) {
+    console.error("❌ MONGO_URI is not set!");
+    process.exit(1);
+}
+
 const mongoClient = new MongoClient(process.env.MONGO_URI);
-await mongoClient.connect();
-console.log("✅ Mongo Connected");
+let db;
 
-const db = mongoClient.db();
-
-// Store active SSE sessions
 const sessions = {};
 
-// ─── SSE ENDPOINT — Claude connects here ────────
+// ─── SSE ENDPOINT ────────────────────────────────
 app.get("/sse", async (req, res) => {
     const mcpServer = new McpServer({
         name: "mongodb-events-server",
         version: "1.0.0",
     });
 
-    // Register all your tools here
     mcpServer.tool(
         "search-events",
         "Search events by status, eventType, state, city, or meetingType.",
@@ -47,7 +48,6 @@ app.get("/sse", async (req, res) => {
             if (state) query["eventDetails.state"] = state;
             if (city) query["eventDetails.city"] = { $regex: city, $options: "i" };
             if (meetingType) query["eventDetails.meetingType"] = meetingType;
-
             const events = await db.collection("events").find(query).limit(Math.min(limit, 50)).toArray();
             return { content: [{ type: "text", text: JSON.stringify(events, null, 2) }] };
         }
@@ -137,7 +137,29 @@ app.get("/sse", async (req, res) => {
         }
     );
 
-    // Connect SSE transport
+    mcpServer.tool(
+        "get-event-by-id",
+        "Get full details of a single event by its _id.",
+        { id: z.string() },
+        async ({ id }) => {
+            const event = await db.collection("events").findOne({ _id: id });
+            return { content: [{ type: "text", text: event ? JSON.stringify(event, null, 2) : "Event not found." }] };
+        }
+    );
+
+    mcpServer.tool(
+        "get-staff-assignments",
+        "Get priority and assigned staff for a specific event.",
+        { eventId: z.string() },
+        async ({ eventId }) => {
+            const event = await db.collection("events").findOne(
+                { _id: eventId },
+                { projection: { priorityPreference: 1, staffAssigned: 1, "eventDetails.name": 1, status: 1 } }
+            );
+            return { content: [{ type: "text", text: event ? JSON.stringify(event, null, 2) : "Event not found." }] };
+        }
+    );
+
     const transport = new SSEServerTransport("/messages", res);
     sessions[transport.sessionId] = { transport, mcpServer };
 
@@ -150,15 +172,11 @@ app.get("/sse", async (req, res) => {
     console.log(`🆕 New SSE session: ${transport.sessionId}`);
 });
 
-// ─── MESSAGES ENDPOINT — handles client → server ─
+// ─── MESSAGES ENDPOINT ───────────────────────────
 app.post("/messages", async (req, res) => {
     const sessionId = req.query.sessionId;
     const session = sessions[sessionId];
-
-    if (!session) {
-        return res.status(404).json({ error: "Session not found" });
-    }
-
+    if (!session) return res.status(404).json({ error: "Session not found" });
     await session.transport.handlePostMessage(req, res);
 });
 
@@ -168,10 +186,7 @@ app.get("/", (req, res) => {
         status: "ok",
         service: "MongoDB Events MCP Server",
         activeSessions: Object.keys(sessions).length,
-        endpoints: {
-            sse: "/sse",
-            messages: "/messages",
-        },
+        endpoints: { sse: "/sse", messages: "/messages" },
     });
 });
 
@@ -181,13 +196,26 @@ async function shutdown() {
     await mongoClient.close();
     process.exit(0);
 }
-
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📡 SSE endpoint: /sse`);
-    console.log(`📨 Messages endpoint: /messages`);
-});
+// ─── START SERVER ────────────────────────────────
+async function start() {
+    try {
+        await mongoClient.connect();
+        console.log("✅ Mongo Connected");
+        db = mongoClient.db();
+
+        const PORT = process.env.PORT || 3000;
+        app.listen(PORT, () => {
+            console.log(`🚀 Server running on port ${PORT}`);
+            console.log(`📡 SSE: /sse`);
+            console.log(`📨 Messages: /messages`);
+        });
+    } catch (err) {
+        console.error("❌ Failed to connect to MongoDB:", err.message);
+        process.exit(1);
+    }
+}
+
+start();
