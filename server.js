@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
@@ -21,10 +21,23 @@ if (!process.env.MONGO_URI) {
 const mongoClient = new MongoClient(process.env.MONGO_URI);
 let db;
 
-const sessions = {};
+const sessions = new Map();
+
+function toObjectId(id) {
+    if (!id) return null;
+    if (ObjectId.isValid(id)) return new ObjectId(id);
+    return null;
+}
+
+function normalizeLimit(limit, fallback = 10, max = 50) {
+    const parsed = Number(limit);
+    if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+    return Math.min(parsed, max);
+}
 
 // ─── SSE ENDPOINT ────────────────────────────────
 app.get("/sse", async (req, res) => {
+    try {
     const mcpServer = new McpServer({
         name: "mongodb-events-server",
         version: "1.0.0",
@@ -48,7 +61,7 @@ app.get("/sse", async (req, res) => {
             if (state) query["eventDetails.state"] = state;
             if (city) query["eventDetails.city"] = { $regex: city, $options: "i" };
             if (meetingType) query["eventDetails.meetingType"] = meetingType;
-            const events = await db.collection("events").find(query).limit(Math.min(limit, 50)).toArray();
+            const events = await db.collection("events").find(query).limit(normalizeLimit(limit)).toArray();
             return { content: [{ type: "text", text: JSON.stringify(events, null, 2) }] };
         }
     );
@@ -76,12 +89,17 @@ app.get("/sse", async (req, res) => {
             limit: z.number().optional().default(10),
         },
         async ({ fromDate, toDate, status, limit }) => {
+            const startDate = new Date(fromDate);
+            const endDate = new Date(toDate);
+            if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+                return { content: [{ type: "text", text: "Invalid date format. Use YYYY-MM-DD." }] };
+            }
             const query = {
                 isDeleted: false,
-                "eventDetails.startDate": { $gte: new Date(fromDate), $lte: new Date(toDate) },
+                "eventDetails.startDate": { $gte: startDate, $lte: endDate },
             };
             if (status) query.status = status;
-            const events = await db.collection("events").find(query).limit(Math.min(limit, 50)).toArray();
+            const events = await db.collection("events").find(query).limit(normalizeLimit(limit)).toArray();
             return { content: [{ type: "text", text: JSON.stringify(events, null, 2) }] };
         }
     );
@@ -132,7 +150,7 @@ app.get("/sse", async (req, res) => {
             const query = { isDeleted: false };
             if (coverageType) query["eventDetails.coverageType"] = coverageType;
             if (additionalService) query["eventDetails.additionalServices"] = additionalService;
-            const events = await db.collection("events").find(query).limit(Math.min(limit, 50)).toArray();
+            const events = await db.collection("events").find(query).limit(normalizeLimit(limit)).toArray();
             return { content: [{ type: "text", text: JSON.stringify(events, null, 2) }] };
         }
     );
@@ -142,7 +160,9 @@ app.get("/sse", async (req, res) => {
         "Get full details of a single event by its _id.",
         { id: z.string() },
         async ({ id }) => {
-            const event = await db.collection("events").findOne({ _id: id });
+            const objectId = toObjectId(id);
+            const query = objectId ? { _id: objectId } : { _id: id };
+            const event = await db.collection("events").findOne(query);
             return { content: [{ type: "text", text: event ? JSON.stringify(event, null, 2) : "Event not found." }] };
         }
     );
@@ -152,8 +172,10 @@ app.get("/sse", async (req, res) => {
         "Get priority and assigned staff for a specific event.",
         { eventId: z.string() },
         async ({ eventId }) => {
+            const objectId = toObjectId(eventId);
+            const query = objectId ? { _id: objectId } : { _id: eventId };
             const event = await db.collection("events").findOne(
-                { _id: eventId },
+                query,
                 { projection: { priorityPreference: 1, staffAssigned: 1, "eventDetails.name": 1, status: 1 } }
             );
             return { content: [{ type: "text", text: event ? JSON.stringify(event, null, 2) : "Event not found." }] };
@@ -161,23 +183,39 @@ app.get("/sse", async (req, res) => {
     );
 
     const transport = new SSEServerTransport("/messages", res);
-    sessions[transport.sessionId] = { transport, mcpServer };
+    sessions.set(transport.sessionId, { transport, mcpServer });
 
     res.on("close", () => {
-        delete sessions[transport.sessionId];
+        sessions.delete(transport.sessionId);
         console.log(`🔌 Session closed: ${transport.sessionId}`);
     });
 
     await mcpServer.connect(transport);
     console.log(`🆕 New SSE session: ${transport.sessionId}`);
+    } catch (error) {
+        console.error("❌ Failed to establish SSE session:", error);
+        if (!res.headersSent) {
+            res.status(500).json({ error: "Failed to start MCP session" });
+        }
+    }
 });
 
 // ─── MESSAGES ENDPOINT ───────────────────────────
 app.post("/messages", async (req, res) => {
-    const sessionId = req.query.sessionId;
-    const session = sessions[sessionId];
-    if (!session) return res.status(404).json({ error: "Session not found" });
-    await session.transport.handlePostMessage(req, res);
+    try {
+        const sessionId = Array.isArray(req.query.sessionId) ? req.query.sessionId[0] : req.query.sessionId;
+        if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
+
+        const session = sessions.get(sessionId);
+        if (!session) return res.status(404).json({ error: "Session not found" });
+
+        await session.transport.handlePostMessage(req, res);
+    } catch (error) {
+        console.error("❌ Failed to process /messages request:", error);
+        if (!res.headersSent) {
+            res.status(500).json({ error: "Failed to process message" });
+        }
+    }
 });
 
 // ─── HEALTH CHECK ────────────────────────────────
@@ -185,7 +223,7 @@ app.get("/", (req, res) => {
     res.json({
         status: "ok",
         service: "MongoDB Events MCP Server",
-        activeSessions: Object.keys(sessions).length,
+        activeSessions: sessions.size,
         endpoints: { sse: "/sse", messages: "/messages" },
     });
 });
@@ -204,7 +242,7 @@ async function start() {
     try {
         await mongoClient.connect();
         console.log("✅ Mongo Connected");
-        db = mongoClient.db();
+        db = mongoClient.db(process.env.DB_NAME);
 
         const PORT = process.env.PORT || 3000;
         app.listen(PORT, () => {
