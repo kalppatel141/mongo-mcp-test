@@ -1,24 +1,21 @@
 {
   "name": "mongo-mcp",
-  "version": "1.0.0",
-  "description": "",
-  "main": "server.js",
-  "devDependencies": {},
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js",
-    "dev": "nodemon server.js"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "version": "2.0.0",
+  "description": "Official MongoDB MCP Server over HTTP (Railway)",
   "type": "module",
+  "main": "start.js",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "start": "node start.js",
+    "dev": "node start.js",
+    "setup": "mongodb-mcp-server setup"
+  },
+  "keywords": ["mongodb", "mcp"],
+  "license": "ISC",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "cors": "^2.8.6",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "mongodb": "^7.2.0",
-    "nodemon": "^3.1.14"
+    "mongodb-mcp-server": "^1.11.0"
   }
 }
